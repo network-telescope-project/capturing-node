@@ -1,22 +1,12 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-   echo "[!] This script must be run as root (use sudo)."
-   exit 1
-fi
-
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
-RAW_DIR="$PROJECT_ROOT/data/raw"
-if [ ! -d "$RAW_DIR" ]; then
-    mkdir -p "$RAW_DIR"
-fi
-
-DURATION=3600
-RING_BUFFER_SIZE=24
-
-INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+INTERFACE="${INTERFACE:-lo}"
+DATA_DIR="${DATA_DIR:-/var/lib/network-telescope/data/raw}"
+DURATION="${DURATION:-3600}"
+RING_BUFFER_SIZE="${RING_BUFFER_SIZE:-24}"
+CAPTURE_CPUS="${CAPTURE_CPUS:-}"
 
 IP_FILTER="not (src net 10.0.0.0/8 or src net 172.16.0.0/12 or src net 192.168.0.0/16 or src net 169.254.0.0/16 or src net 127.0.0.0/8)"
 if ip -6 addr show "$INTERFACE" scope global >/dev/null 2>&1; then
@@ -25,7 +15,35 @@ fi
 PROTO_FILTER="tcp[tcpflags] & (tcp-syn) != 0 and tcp[tcpflags] & (tcp-ack) == 0"
 FILTER="$IP_FILTER and ($PROTO_FILTER)"
 
-echo "[*] Starting capture on $INTERFACE"
-echo "[*] Files saving into: $RAW_DIR"
+mkdir -p "${DATA_DIR}"
 
-sudo dumpcap -i "$INTERFACE" -f "$FILTER" -B 128 -b duration:"$DURATION" -b files:"$RING_BUFFER_SIZE" -n -q -w "$RAW_DIR/capture.pcap"
+echo "[capture] Starting on interface=${INTERFACE}, dir=${DATA_DIR}"
+echo "[capture] Rotation: every ${DURATION}s"
+
+DUMPCAP_ARGS=(
+    -i "${INTERFACE}"
+    -w "${DATA_DIR}/capture.pcap"
+    -b "duration:${DURATION}"
+    -B 128
+    -n
+    -q
+)
+
+if [[ -n "${RING_BUFFER_SIZE}" && "${RING_BUFFER_SIZE}" -gt 0 ]]; then
+    DUMPCAP_ARGS+=(-b "files:${RING_BUFFER_SIZE}")
+fi
+
+if [[ -n "${FILTER}" ]]; then
+    echo "[capture] filter=${FILTER}"
+    DUMPCAP_ARGS+=(-f "${FILTER}")
+fi
+
+CMD=("dumpcap" "${DUMPCAP_ARGS[@]}")
+
+if [[ -n "${CAPTURE_CPUS}" ]]; then
+    echo "[capture] Pinning to CPUs: ${CAPTURE_CPUS}"
+    CMD=("taskset" "-c" "${CAPTURE_CPUS}" "${CMD[@]}")
+fi
+
+echo "[capture] Running: ${CMD[*]}"
+exec "${CMD[@]}"

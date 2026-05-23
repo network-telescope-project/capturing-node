@@ -1,0 +1,47 @@
+[Unit]
+Description=Network Telescope Capturing Service
+After=network-online.target
+Wants=network-online.target
+Before=nt-file-detector.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/network-telescope/capturing-node.env
+
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart=${PROJECT_ROOT}/scripts/capture.sh
+Restart=always
+RestartSec=5
+
+# Dedicated user created by setup.sh
+User=nt-capture
+Group=nt-capture
+
+# dumpcap access to raw sockets without full root
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# CPU affinity (set by setup.sh)
+# CPUAffinity=2-7
+
+# I/O and scheduling priorities
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+
+# Resource limits
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/network-telescope/data/raw
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nt-capture
+
+[Install]
+WantedBy=multi-user.target

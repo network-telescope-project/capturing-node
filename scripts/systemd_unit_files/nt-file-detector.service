@@ -1,0 +1,33 @@
+[Unit]
+Description=Network Telescope File Detector and Handoff Service
+After=network-online.target nt-capture.service
+Wants=network-online.target
+BindsTo=nt-capture.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/network-telescope/capturing-node.env
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart=${PROJECT_ROOT}/scripts/file_detector.sh
+Restart=always
+RestartSec=5
+
+User=nt-capture
+Group=nt-capture
+
+# CPU affinity (set by setup.sh)
+# CPUAffinity=0-1
+
+LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/network-telescope/data/raw
+ReadWritePaths=/tmp
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nt-file-detector
+
+[Install]
+WantedBy=multi-user.target

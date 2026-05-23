@@ -3,6 +3,7 @@ data
 venv
 .venv
 .idea
+.env
 
 # System files
 .DS_Store
