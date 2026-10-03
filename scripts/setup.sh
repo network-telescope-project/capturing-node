@@ -15,6 +15,8 @@ SSH_DIR="${NT_HOME}/.ssh"
 CONF_DIR="/etc/network-telescope"
 ENV_FILE="${CONF_DIR}/capturing-node.env"
 
+# TODO We will need to move the repository to /opt because of permissions
+
 # --Helpers-------------------------------------------------------------------
 log()  { echo "[*] $*"; }
 ok()   { echo -e "\033[1;32m[+]\033[0m $*"; }
@@ -52,7 +54,7 @@ if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("wireshark-common" "inotify-tools" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq")
+SYSTEM_DEPS=("wireshark-common" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq")
 MISSING_DEPS=()
 
 log "Auditing CAPTURE node dependencies..."
@@ -217,12 +219,14 @@ EOF
 sysctl --system -q
 
 # --NIC tuning-------------------------------------------------------------
+# TODO better get the actual interface then relying on the one written in .env.example
 IFACE=$(grep "^INTERFACE" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' | xargs)
 if [[ -n "${IFACE}" && "${IFACE}" != "lo" ]]; then
     log "Tuning NIC: ${IFACE}"
     # Maximize ring buffer
     ethtool -G "${IFACE}" rx 4096 tx 4096 2>/dev/null || warn "Could not set ring buffer on ${IFACE}"
     # Disable offloads that can cause issues with packet capture
+    # TODO this is supposedly not permanent - have to add some persistent fix
     ethtool -K "${IFACE}" gro off lro off 2>/dev/null || warn "Could not disable GRO/LRO on ${IFACE}"
 
     # IRQ affinity: pin NIC interrupts to capture CPUs
@@ -298,32 +302,45 @@ else
     warn "SSH key already exists: ${SSH_DIR}/id_ed25519"
 fi
 
+# --Firewall configuration-------------------------------------------------
+# TODO: Configure firewall rules for production deployment:
+#   ufw allow 22/tcp                                          # SSH (already default on most VPS)
+#   ufw allow from <PROCESSING_NODE_VPC_IP> to any port 9100 # Prometheus node-exporter scraping
+#   ufw default deny incoming
+#   ufw enable
+
 # --Systemd services-------------------------------------------------------
 log "Installing systemd unit files..."
 UNIT_SRC="${SCRIPT_DIR}/systemd_unit_files"
 
+chmod +x "${SCRIPT_DIR}"/{capture,file_detector,sweep,start}.sh
+
 # Patch CPU affinity into unit files
-for unit in nt-capture nt-file-detector; do
-    src="${UNIT_SRC}/${unit}.service"
-    dest="/etc/systemd/system/${unit}.service"
+for unit in nt-capture.service nt-file-detector.service nt-sweep.service nt-sweep.timer; do
+    src="${UNIT_SRC}/${unit}"
+    dest="/etc/systemd/system/${unit}"
 
-    # Replace placeholders in original unit files
-    sed "s|@PROJECT_ROOT@|${PROJECT_ROOT}|g" "$src" > "${src}.temp"
-
-    if [[ ! -f "${dest}" ]]; then
-        mv "${src}.temp" "${dest}"
-        ok "Created systemd unit file '$dest'."
-    else
-        warn "Systemd unit file '$dest' already exists."
+    if [[ -f "${dest}" ]]; then
+        warn "Systemd unit file '$dest' already exists - overwriting."
     fi
+    sed "s|@PROJECT_ROOT@|${PROJECT_ROOT}|g" "$src" > "${dest}"
+    ok "Installed systemd unit file '$dest'."
 done
 
 # Patch capture CPUs
 sed -i "s|^# CPUAffinity=2-7|CPUAffinity=${CAPTURE_CPUS}|" /etc/systemd/system/nt-capture.service
 sed -i "s|^# CPUAffinity=0-1|CPUAffinity=${MGMT_CPUS}|" /etc/systemd/system/nt-file-detector.service
+sed -i "s|^# CPUAffinity=0-1|CPUAffinity=${MGMT_CPUS}|" /etc/systemd/system/nt-sweep.service
 
 systemctl daemon-reload
-systemctl enable nt-capture nt-file-detector
+systemctl enable nt-capture nt-file-detector nt-sweep.timer
+systemctl try-restart nt-sweep.timer
+
+for unit in nt-file-detector nt-capture; do
+    if systemctl is-active --quiet "${unit}"; then
+        warn "${unit} is already running - restart it to apply the updated unit file/scripts: systemctl restart ${unit}"
+    fi
+done
 
 echo ""
 ok "Capture node setup is done."

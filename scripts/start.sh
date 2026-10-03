@@ -81,7 +81,7 @@ fi
 REMOTE="${REMOTE_HOST:-}"
 if [[ -n "${REMOTE}" && "${REMOTE}" != "CHANGE_ME" ]]; then
     SSH_KEY="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
-    if ssh -i "${SSH_KEY}" -o ConnectTimeout=5 -o BatchMode=yes \
+    if sudo -u ${NT_USER} ssh -i "${SSH_KEY}" -o ConnectTimeout=5 -o BatchMode=yes \
            "${REMOTE_USER:-telescope}@${REMOTE}" "echo ok" &>/dev/null; then
         ok "SSH to processing node (${REMOTE}) OK"
     else
@@ -96,6 +96,7 @@ fi
 echo ""
 check_or_start_service nt-capture
 check_or_start_service nt-file-detector
+check_or_start_service nt-sweep.timer
 check_or_start_service prometheus-node-exporter
 
 # --dumpcap process check-----------------------------------------------------

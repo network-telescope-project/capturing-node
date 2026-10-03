@@ -1,15 +1,15 @@
 [Unit]
 Description=Network Telescope Capturing Service
-After=network-online.target
+After=network-online.target nt-file-detector.service
 Wants=network-online.target
-Before=nt-file-detector.service
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/network-telescope/capturing-node.env
 
 WorkingDirectory=@PROJECT_ROOT@
-ExecStart=${PROJECT_ROOT}/scripts/capture.sh
+
+ExecStart=@PROJECT_ROOT@/scripts/capture.sh
 Restart=always
 RestartSec=5
 
