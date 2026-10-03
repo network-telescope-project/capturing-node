@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically send PCAP files the file detector missed
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=1h
+
+[Install]
+WantedBy=timers.target

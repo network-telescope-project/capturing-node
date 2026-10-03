@@ -11,6 +11,8 @@ SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
 DETECTOR_CPUS="${DETECTOR_CPUS:-}"
 
 LOCK_FILE="/tmp/nt-file-detector.lock"
+TRANSFER_LOCK="${DATA_DIR}/.transfer.lock"
+
 MAX_RETRIES=5
 RETRY_DELAY=60
 
@@ -34,18 +36,30 @@ transfer_file() {
     fi
 
     local attempt=0
+    local rc
     while [[ ${attempt} -lt ${MAX_RETRIES} ]]; do
         attempt=$(( attempt + 1 ))
         log_info "Transferring ${filename} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR} (attempt ${attempt})"
 
-        if rsync -az --checksum \
-            -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10" \
-            "${filepath}" \
-            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"; then
+        rc=0
+        (
+            flock 9
+            # The sweep may have sent it while we waited for the lock or slept between retries
+            [[ -f "${filepath}" ]] || exit 2
 
-            log_info "Transfer OK: ${filename}"
+            rsync -az --checksum \
+                -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10" \
+                "${filepath}" \
+                "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/" || exit 1
 
             rm -f "${filepath}"
+        ) 9>"${TRANSFER_LOCK}" || rc=$?
+
+        if [[ ${rc} -eq 0 ]]; then
+            log_info "Transfer OK: ${filename}"
+            return 0
+        elif [[ ${rc} -eq 2 ]]; then
+            log_info "Already transferred by the sweep: ${filename}"
             return 0
         fi
 
