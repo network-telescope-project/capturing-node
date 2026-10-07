@@ -9,7 +9,7 @@ EnvironmentFile=/etc/network-telescope/capturing-node.env
 
 WorkingDirectory=@PROJECT_ROOT@
 
-ExecStart=@PROJECT_ROOT@/scripts/capture.sh
+ExecStart=@PROJECT_ROOT@/capture/capture.sh
 Restart=always
 RestartSec=5
 

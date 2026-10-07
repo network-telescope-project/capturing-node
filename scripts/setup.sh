@@ -54,7 +54,7 @@ if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("wireshark-common" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq")
+SYSTEM_DEPS=("wireshark-common" "python3" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq")
 MISSING_DEPS=()
 
 log "Auditing CAPTURE node dependencies..."
@@ -218,9 +218,35 @@ net.ipv4.conf.default.rp_filter = 0
 EOF
 sysctl --system -q
 
+# --Interface lookup-------------------------------------------------------
+DETECTED_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}') || true
+if [ -z "$DETECTED_IFACE" ]; then  # local routing table fallback
+    DETECTED_IFACE=$(ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' | head -n 1) || true
+fi
+
+ENV_IFACE=$(grep "^INTERFACE=" "${ENV_FILE}" | cut -d= -f2- | tr -d '"'\'' ' | xargs 2>/dev/null) || true
+if [[ -n "${ENV_IFACE}" && "${ENV_IFACE}" != "lo" ]]; then
+    IFACE="${ENV_IFACE}"
+    log "Using interface configured in .env: ${IFACE}"
+
+    if [[ -n "${DETECTED_IFACE}" && "${IFACE}" != "${DETECTED_IFACE}" ]]; then
+        warn "  Note: Configured interface (${IFACE}) differs from detected internet route (${DETECTED_IFACE})"
+    fi
+elif [ -n "$DETECTED_IFACE" ]; then
+    IFACE="${DETECTED_IFACE}"
+    log "Auto-detected primary internet interface: ${IFACE}"
+    sed -i "s|^INTERFACE=.*|INTERFACE=${IFACE}|" "${ENV_FILE}"
+else
+    err "No internet-facing interface could be determined automatically or via .env"
+    exit 1
+fi
+
+if ! ip link show "${IFACE}" 2>/dev/null | grep -q "state UP"; then
+    warn "Interface '${IFACE}' is not currently in an UP operational state!"
+fi
+
 # --NIC tuning-------------------------------------------------------------
-# TODO better get the actual interface then relying on the one written in .env.example
-IFACE=$(grep "^INTERFACE" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' | xargs)
+#IFACE=$(grep "^INTERFACE" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' | xargs)
 if [[ -n "${IFACE}" && "${IFACE}" != "lo" ]]; then
     log "Tuning NIC: ${IFACE}"
     # Maximize ring buffer
@@ -251,6 +277,29 @@ print(hex(bits)[2:])
     done
 else
     warn "INTERFACE is 'lo' or unset - skipping NIC tuning."
+fi
+
+# --Darknet destinations---------------------------------------------------
+# Prefixes routed to the node but not configured on it cannot be detected and has to be appended manually
+grep -q "^DARKNET_NETS=" "${ENV_FILE}" || echo -e "\nDARKNET_NETS=" >> "${ENV_FILE}"
+CURRENT_NETS=$(grep "^DARKNET_NETS=" "${ENV_FILE}" | cut -d= -f2- | tr -d '"' | xargs || true)
+if ip link show "${IFACE}" &>/dev/null; then
+    if [[ -z "${CURRENT_NETS}" ]]; then
+        DETECTED=$(python3 "${PROJECT_ROOT}/helpers/darknet.py" detect "${IFACE}")
+        if [[ -n "${DETECTED}" ]]; then
+            sed -i "s|^DARKNET_NETS=.*|DARKNET_NETS=${DETECTED}|" "${ENV_FILE}"
+            ok "DARKNET_NETS set from the public addresses of ${IFACE}: ${DETECTED}"
+            warn "  Prefixes routed to this node that are not configured on it must be added by hand in ${ENV_FILE}."
+        else
+            warn "No public address found on ${IFACE}: set DARKNET_NETS in ${ENV_FILE} by hand (capture will not start without it)."
+        fi
+    else
+        UNCOVERED=$(python3 "${PROJECT_ROOT}/helpers/darknet.py" missing "${IFACE}" "${CURRENT_NETS}")
+        ok "DARKNET_NETS already set: ${CURRENT_NETS}"
+        [[ -z "${UNCOVERED}" ]] || warn "  Public address(es) on ${IFACE} not covered by it (not captured): ${UNCOVERED}"
+    fi
+else
+    warn "Interface '${IFACE}' not found: DARKNET_NETS not detected. Fix INTERFACE in ${ENV_FILE} and re-run setup.sh."
 fi
 
 # --Prometheus node exporter tuning----------------------------------------
@@ -311,14 +360,19 @@ fi
 
 # --Systemd services-------------------------------------------------------
 log "Installing systemd unit files..."
-UNIT_SRC="${SCRIPT_DIR}/systemd_unit_files"
+UNIT_FILES=(
+    capture/nt-capture.service
+    transfer/nt-file-detector.service
+    transfer/nt-sweep.service
+    transfer/nt-sweep.timer
+)
 
-chmod +x "${SCRIPT_DIR}"/{capture,file_detector,sweep,start}.sh
+chmod +x "${PROJECT_ROOT}/capture/capture.sh" "${PROJECT_ROOT}"/transfer/{file_detector,sweep}.sh "${SCRIPT_DIR}/start.sh"
 
 # Patch CPU affinity into unit files
-for unit in nt-capture.service nt-file-detector.service nt-sweep.service nt-sweep.timer; do
-    src="${UNIT_SRC}/${unit}"
-    dest="/etc/systemd/system/${unit}"
+for unit_file in "${UNIT_FILES[@]}"; do
+    src="${PROJECT_ROOT}/${unit_file}"
+    dest="/etc/systemd/system/$(basename "${unit_file}")"
 
     if [[ -f "${dest}" ]]; then
         warn "Systemd unit file '$dest' already exists - overwriting."
@@ -349,5 +403,9 @@ echo -e "\033[1;33mNext steps:\033[0m"
 echo -e "\033[1;33m   1. Edit ${ENV_FILE}\033[0m"
 echo -e "\033[1;33m   2. Copy SSH public key to processing node\033[0m"
 echo -e "\033[1;33m   3. Run: sudo ./scripts/start.sh\033[0m"
+echo ""
+warn "RING_BUFFER_SIZE (default 24) = max PCAP files kept on this node, one per DURATION (default 1 h)."
+warn "  If more pile up (e.g. processing node unreachable) the oldest are deleted untransferred."
+warn "  Set it in ${ENV_FILE} from this node's disk size and the expected MB per file (0 = no limit, disk can fill)."
 echo ""
 warn "A reboot is recommended."
