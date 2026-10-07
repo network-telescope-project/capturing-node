@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=/etc/network-telescope/capturing-node.env
 WorkingDirectory=@PROJECT_ROOT@
-ExecStart=@PROJECT_ROOT@/scripts/sweep.sh
+ExecStart=@PROJECT_ROOT@/transfer/sweep.sh
 
 User=nt-capture
 Group=nt-capture

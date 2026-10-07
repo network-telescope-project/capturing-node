@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+NT_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
+
 cleanup() {
     echo "[entrypoint] Shutting down..."
     kill "${CAPTURE_PID}" "${DETECTOR_PID}" 2>/dev/null || true
@@ -10,14 +12,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[entrypoint] Starting capture..."
-/scripts/capture.sh &
+"${NT_DIR}/capture/capture.sh" &
 CAPTURE_PID=$!
 
 # Give dumpcap a moment to start writing before we watch
 sleep 2
 
 echo "[entrypoint] Starting file_detector..."
-/scripts/file_detector.sh &
+"${NT_DIR}/transfer/file_detector.sh" &
 DETECTOR_PID=$!
 
 # Wait for either process to exit; if one dies, the trap kills the other

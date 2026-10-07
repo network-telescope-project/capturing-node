@@ -8,6 +8,8 @@ DATA_DIR="${NT_HOME}/data"
 RAW_DIR="${DATA_DIR}/raw"
 CONF_DIR="/etc/network-telescope"
 ENV_FILE="${CONF_DIR}/capturing-node.env"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+HELPERS_DIR="$(dirname "${SCRIPT_DIR}")/helpers"
 
 NT_USER="nt-capture"
 NT_GROUP="nt-capture"
@@ -59,6 +61,14 @@ if [[ -d "${RAW_DIR}" ]]; then
     else
         ok "Disk space OK: ${AVAIL_GB}GB available"
     fi
+
+    RING="${RING_BUFFER_SIZE:-24}"
+    if [[ "${RING}" -gt 0 ]]; then
+        warn "Ring buffer: only the last ${RING} PCAP files are kept (1 per ${DURATION:-3600}s); older ones are deleted even if not yet transferred (if file transfer fails)."
+        warn "  Set RING_BUFFER_SIZE in ${ENV_FILE} from this node's disk (${AVAIL_GB}GB free) and the expected MB per file."
+    else
+        warn "Ring buffer disabled (RING_BUFFER_SIZE=0): no file limit, the disk can fill up if transfers fail."
+    fi
 else
     err "Capture directory missing: ${RAW_DIR}"
     ERRORS=$(( ERRORS + 1 ))
@@ -72,6 +82,20 @@ if [[ "${IFACE}" == "UNSET" || "${IFACE}" == "CHANGE_ME" ]]; then
 elif ip link show "${IFACE}" &>/dev/null; then
     STATE=$(ip link show "${IFACE}" | grep -oP '(?<=state )\w+' || echo "UNKNOWN")
     ok "Interface ${IFACE} exists (state: ${STATE})"
+
+    # --Darknet destinations--------------------------------------------------
+    if [[ -z "${DARKNET_NETS:-}" ]]; then
+        if [[ "${TRANSFER_MODE:-local}" == "remote" ]]; then
+            err "DARKNET_NETS is empty in ${ENV_FILE}: capture will not start (re-run setup.sh or set it by hand)"
+            ERRORS=$(( ERRORS + 1 ))
+        fi
+    elif UNCOVERED=$(python3 "${HELPERS_DIR}/darknet.py" missing "${IFACE}" "${DARKNET_NETS}"); then
+        ok "Capturing traffic to: ${DARKNET_NETS}"
+        [[ -z "${UNCOVERED}" ]] || warn "Public address(es) on ${IFACE} not covered by DARKNET_NETS (not captured): ${UNCOVERED}"
+    else
+        err "DARKNET_NETS is invalid: ${DARKNET_NETS}"
+        ERRORS=$(( ERRORS + 1 ))
+    fi
 else
     err "Interface ${IFACE} not found on this machine"
     ERRORS=$(( ERRORS + 1 ))

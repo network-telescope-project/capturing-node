@@ -1,0 +1,21 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    wireshark-common \
+    inotify-tools \
+    rsync \
+    openssh-client \
+    procps \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build context is the capturing-node root; the layout mirrors the repository
+COPY capture/ /opt/nt/capture/
+COPY transfer/ /opt/nt/transfer/
+COPY helpers/ /opt/nt/helpers/
+COPY local/entrypoint_local.sh /opt/nt/local/entrypoint_local.sh
+RUN chmod +x /opt/nt/capture/*.sh /opt/nt/transfer/*.sh /opt/nt/local/*.sh
+
+ENTRYPOINT ["/opt/nt/local/entrypoint_local.sh"]

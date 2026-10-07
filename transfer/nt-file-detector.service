@@ -8,7 +8,7 @@ Type=simple
 EnvironmentFile=/etc/network-telescope/capturing-node.env
 WorkingDirectory=@PROJECT_ROOT@
 
-ExecStart=@PROJECT_ROOT@/scripts/file_detector.sh
+ExecStart=@PROJECT_ROOT@/transfer/file_detector.sh
 Restart=always
 RestartSec=5
 
