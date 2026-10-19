@@ -101,6 +101,16 @@ else
     ERRORS=$(( ERRORS + 1 ))
 fi
 
+# --Sensor ID-----------------------------------------------------------------
+if [[ "${TRANSFER_MODE:-local}" == "remote" ]]; then
+    if [[ "${SENSOR_ID:-}" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; then
+        ok "Sensor ID: ${SENSOR_ID} (files go to ${REMOTE_DIR:-/var/lib/network-telescope/data/queue}/${SENSOR_ID}/; it must be registered on the processing node)"
+    else
+        err "SENSOR_ID is not set or invalid in ${ENV_FILE} (1-32 characters of a-z, 0-9, '-', '_'): files cannot be transferred"
+        ERRORS=$(( ERRORS + 1 ))
+    fi
+fi
+
 # --SSH connectivity----------------------------------------------------------
 REMOTE="${REMOTE_HOST:-}"
 if [[ -n "${REMOTE}" && "${REMOTE}" != "CHANGE_ME" ]]; then

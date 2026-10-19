@@ -35,6 +35,12 @@ if [[ -z "${REMOTE_HOST}" ]]; then
     log_err "ERROR: REMOTE_HOST not set but TRANSFER_MODE=remote"
     exit 1
 fi
+SENSOR_ID="${SENSOR_ID:-}"
+if [[ ! "${SENSOR_ID}" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; then
+    log_err "ERROR: SENSOR_ID '${SENSOR_ID}' is not set or invalid (1-32 characters of a-z, 0-9, '-', '_') but TRANSFER_MODE=remote"
+    exit 1
+fi
+REMOTE_TARGET="${REMOTE_DIR}/${SENSOR_ID}"
 if ! command -v fuser >/dev/null; then
     log_err "ERROR: 'fuser' (package psmisc) is required to tell open PCAPs from closed ones"
     exit 1
@@ -53,7 +59,7 @@ send_file() {
         rsync -az --checksum \
             -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10" \
             "${filepath}" \
-            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/" || exit 1
+            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_TARGET}/" || exit 1
 
         rm -f "${filepath}"
     ) 9>"${TRANSFER_LOCK}" || rc=$?

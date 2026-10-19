@@ -7,6 +7,8 @@ TRANSFER_MODE="${TRANSFER_MODE:-local}"
 REMOTE_USER="${REMOTE_USER:-telescope}"
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_DIR="${REMOTE_DIR:-/var/lib/network-telescope/data/queue}"
+SENSOR_ID="${SENSOR_ID:-}"
+REMOTE_TARGET="${REMOTE_DIR}/${SENSOR_ID}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
 DETECTOR_CPUS="${DETECTOR_CPUS:-}"
 
@@ -34,12 +36,16 @@ transfer_file() {
         log_err "ERROR: REMOTE_HOST not set but TRANSFER_MODE=remote"
         return 1
     fi
+    if [[ ! "${SENSOR_ID}" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; then
+        log_err "ERROR: SENSOR_ID '${SENSOR_ID}' is not set or invalid (1-32 characters of a-z, 0-9, '-', '_') but TRANSFER_MODE=remote"
+        return 1
+    fi
 
     local attempt=0
     local rc
     while [[ ${attempt} -lt ${MAX_RETRIES} ]]; do
         attempt=$(( attempt + 1 ))
-        log_info "Transferring ${filename} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR} (attempt ${attempt})"
+        log_info "Transferring ${filename} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_TARGET} (attempt ${attempt})"
 
         rc=0
         (
@@ -50,7 +56,7 @@ transfer_file() {
             rsync -az --checksum \
                 -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10" \
                 "${filepath}" \
-                "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/" || exit 1
+                "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_TARGET}/" || exit 1
 
             rm -f "${filepath}"
         ) 9>"${TRANSFER_LOCK}" || rc=$?
@@ -84,7 +90,7 @@ trap 'rm -f "${LOCK_FILE}"; log_info "Stopped."' EXIT
 mkdir -p "${DATA_DIR}"
 
 log_info "Watching '${DATA_DIR}' for closed PCAP files (mode=${TRANSFER_MODE})"
-[[ "${TRANSFER_MODE}" == "remote" ]] && log_info "Remote target: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+[[ "${TRANSFER_MODE}" == "remote" ]] && log_info "Remote target: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_TARGET}"
 
 INOTIFY_CMD=(inotifywait -m -e close_write -q --format '%w%f' "${DATA_DIR}")
 if [[ -n "${DETECTOR_CPUS}" ]]; then
