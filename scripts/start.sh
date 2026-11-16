@@ -101,25 +101,21 @@ else
     ERRORS=$(( ERRORS + 1 ))
 fi
 
-# --Sensor ID-----------------------------------------------------------------
-if [[ "${TRANSFER_MODE:-local}" == "remote" ]]; then
-    if [[ "${SENSOR_ID:-}" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; then
-        ok "Sensor ID: ${SENSOR_ID} (files go to ${REMOTE_DIR:-/var/lib/network-telescope/data/queue}/${SENSOR_ID}/; it must be registered on the processing node)"
-    else
-        err "SENSOR_ID is not set or invalid in ${ENV_FILE} (1-32 characters of a-z, 0-9, '-', '_'): files cannot be transferred"
-        ERRORS=$(( ERRORS + 1 ))
-    fi
-fi
-
 # --SSH connectivity----------------------------------------------------------
 REMOTE="${REMOTE_HOST:-}"
 if [[ -n "${REMOTE}" && "${REMOTE}" != "CHANGE_ME" ]]; then
     SSH_KEY="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
-    if sudo -u ${NT_USER} ssh -i "${SSH_KEY}" -o ConnectTimeout=5 -o BatchMode=yes \
-           "${REMOTE_USER:-telescope}@${REMOTE}" "echo ok" &>/dev/null; then
-        ok "SSH to processing node (${REMOTE}) OK"
+    KNOWN_HOSTS="${SSH_KEY%/*}/known_hosts"
+    PORT="${REMOTE_PORT:-8500}"
+    if ! ssh-keygen -F "[${REMOTE}]:${PORT}" -f "${KNOWN_HOSTS}" &>/dev/null; then
+        err "Processing node host key is not pinned in ${KNOWN_HOSTS} - re-run setup.sh once the node is registered there"
+        ERRORS=$(( ERRORS + 1 ))
+    elif sudo -u ${NT_USER} rsync -rn --exclude='*' \
+           -e "ssh -i ${SSH_KEY} -p ${PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o ConnectTimeout=5" \
+           "${RAW_DIR}/" "${REMOTE_USER:-telescope}@${REMOTE}:./" &>/dev/null; then
+        ok "Delivery to processing node (${REMOTE}:${PORT}) OK"
     else
-        err "Cannot SSH to processing node (${REMOTE}) - check key and REMOTE_HOST"
+        err "Cannot deliver to processing node (${REMOTE}:${PORT}) - was add-sensor.sh run there for this node (key, IP)? Check REMOTE_HOST/REMOTE_PORT"
         ERRORS=$(( ERRORS + 1 ))
     fi
 else

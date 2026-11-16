@@ -15,13 +15,12 @@ SSH_DIR="${NT_HOME}/.ssh"
 CONF_DIR="/etc/network-telescope"
 ENV_FILE="${CONF_DIR}/capturing-node.env"
 
-# TODO We will need to move the repository to /opt because of permissions
-
 # --Helpers-------------------------------------------------------------------
 log()  { echo "[*] $*"; }
 ok()   { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[i]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[!]\033[0m ERROR: $*" >&2; }
+env_value() { grep "^$1=" "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d "\"' " || true; }
 require_root() {
     if [[ $EUID -ne 0 ]]; then
        err "This script must be run as root (use sudo)."
@@ -53,8 +52,14 @@ if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
     exit 1
 fi
 
+if [[ "${PROJECT_ROOT}" == /home/* || "${PROJECT_ROOT}" == /root/* ]]; then
+    err "The repo is in ${PROJECT_ROOT}, which user '${NT_USER}' cannot read."
+    err "Clone it to /opt/network-telescope and run scripts/setup.sh from there."
+    exit 1
+fi
+
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("wireshark-common" "python3" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq")
+SYSTEM_DEPS=("wireshark-common" "python3" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq" "ufw")
 MISSING_DEPS=()
 
 log "Auditing CAPTURE node dependencies..."
@@ -343,20 +348,9 @@ if [[ ! -f "${SSH_DIR}/id_ed25519" ]]; then
     chmod 600 "${SSH_DIR}/id_ed25519"
     chmod 644 "${SSH_DIR}/id_ed25519.pub"
     log "SSH key generated: ${SSH_DIR}/id_ed25519.pub"
-    warn "Copy this public key to processing node"
-    cat "${SSH_DIR}/id_ed25519.pub"
-    echo "telescope@<PROCESSING_NODE_IP>"
-    echo ""
 else
     warn "SSH key already exists: ${SSH_DIR}/id_ed25519"
 fi
-
-# --Firewall configuration-------------------------------------------------
-# TODO: Configure firewall rules for production deployment:
-#   ufw allow 22/tcp                                          # SSH (already default on most VPS)
-#   ufw allow from <PROCESSING_NODE_VPC_IP> to any port 9100 # Prometheus node-exporter scraping
-#   ufw default deny incoming
-#   ufw enable
 
 # --Systemd services-------------------------------------------------------
 log "Installing systemd unit files..."
@@ -396,12 +390,88 @@ for unit in nt-file-detector nt-capture; do
     fi
 done
 
+# --Registration on the processing node----------------------------------
+REMOTE_HOST=$(env_value REMOTE_HOST)
+REMOTE_PORT=$(env_value REMOTE_PORT)
+REMOTE_PORT="${REMOTE_PORT:-8500}"
+KNOWN_HOSTS="${SSH_DIR}/known_hosts"
+
+if ! is_valid_ip "${REMOTE_HOST}"; then
+    warn "REMOTE_HOST is not set in ${ENV_FILE}: skipping registration and firewall. Set it and re-run setup.sh"
+else
+    NODE_IP=$(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null || true)
+    is_valid_ip "${NODE_IP}" || { warn "Could not detect this node's public IPv4: replace <NODE_IP> in the command below."; NODE_IP="<NODE_IP>"; }
+
+    NETS=$(env_value DARKNET_NETS)
+    [[ -n "${NETS}" ]] || warn "DARKNET_NETS is empty: replace <DARKNET_NETS> in the command below (comma separated)."
+    echo ""
+    warn "Register this node (run on the processing node):"
+    echo "  sudo /opt/network-telescope/scripts/add-sensor.sh ${NODE_IP} \"${NETS:-<DARKNET_NETS>}\" \"$(cat "${SSH_DIR}/id_ed25519.pub")\""
+    echo ""
+    read -r -p "Press Enter once it has run there (or type 's' to skip and re-run setup.sh later): " ANSWER
+
+    # Pin the processing node's host key
+    if ssh-keygen -F "[${REMOTE_HOST}]:${REMOTE_PORT}" -f "${KNOWN_HOSTS}" &>/dev/null; then
+        ok "Processing node host key already pinned."
+    elif [[ "${ANSWER}" == "s" ]]; then
+        warn "Host key not pinned yet: re-run setup.sh after registering this node."
+    else
+        HOST_KEY=$(ssh-keyscan -T 10 -p "${REMOTE_PORT}" -t ed25519 "${REMOTE_HOST}" 2>/dev/null || true)
+        if [[ -z "${HOST_KEY}" ]]; then
+            warn "No answer from ${REMOTE_HOST}:${REMOTE_PORT} (node not registered yet, or blocked): re-run setup.sh to pin its host key."
+        else
+            echo "SSH host key offered by ${REMOTE_HOST}:${REMOTE_PORT}:"
+            ssh-keygen -lf /dev/stdin <<< "${HOST_KEY}"
+            read -r -p "Does it match the fingerprint printed at the end of setup.sh on the processing node? [y/N] " ANSWER
+            if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+                echo "${HOST_KEY}" >> "${KNOWN_HOSTS}"
+                chown "${NT_USER}:${NT_GROUP}" "${KNOWN_HOSTS}"
+                chmod 644 "${KNOWN_HOSTS}"
+                ok "Host key pinned in ${KNOWN_HOSTS}"
+            else
+                err "Host key NOT pinned - fingerprint differs."
+            fi
+        fi
+    fi
+
+    # --Firewall---------------------------------------------------------------
+    SSH_PORTS=$(ss -ltnpH | awk '/"sshd"/ {n=split($4, a, ":"); print a[n]}' | sort -u)
+    if [[ -z "${SSH_PORTS}" ]]; then
+        warn "Could not find the port sshd listens on: not enabling the firewall."
+    else
+        ufw logging off > /dev/null   # scans of the darknet would flood the log
+        ufw default deny incoming > /dev/null
+        ufw default allow outgoing > /dev/null
+        for port in ${SSH_PORTS}; do
+            ufw allow "${port}/tcp" comment "nt-ssh" > /dev/null
+        done
+        ufw allow proto tcp from "${REMOTE_HOST}" to any port 9100 comment "nt-prometheus" > /dev/null   # node-exporter
+
+        if ufw status | grep -q "^Status: active"; then
+            ok "Firewall already active - rules updated."
+        else
+            systemd-run --quiet --unit=nt-ufw-rollback --on-active=5min /usr/sbin/ufw disable
+            ufw --force enable > /dev/null
+            warn "Firewall enabled (ssh port(s): ${SSH_PORTS//$'\n'/ }); it disables itself in 5 minutes unless you confirm."
+            warn "Open a NEW ssh session to this node now (keep this one open), then answer here."
+            read -r -p "Does the new session work? [y/N] " ANSWER
+            systemctl stop nt-ufw-rollback.timer
+            if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+                ok "Firewall confirmed."
+            else
+                ufw disable > /dev/null
+                err "Firewall disabled again. Check the ssh port and re-run setup.sh."
+            fi
+        fi
+    fi
+fi
+
 echo ""
 ok "Capture node setup is done."
 echo ""
 echo -e "\033[1;33mNext steps:\033[0m"
 echo -e "\033[1;33m   1. Edit ${ENV_FILE}\033[0m"
-echo -e "\033[1;33m   2. Copy SSH public key to processing node\033[0m"
+echo -e "\033[1;33m   2. If you skipped the registration: re-run setup.sh once REMOTE_HOST is set and the node is registered\033[0m"
 echo -e "\033[1;33m   3. Run: sudo ./scripts/start.sh\033[0m"
 echo ""
 warn "RING_BUFFER_SIZE (default 24) = max PCAP files kept on this node, one per DURATION (default 1 h)."
