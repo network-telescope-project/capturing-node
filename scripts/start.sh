@@ -101,6 +101,23 @@ else
     ERRORS=$(( ERRORS + 1 ))
 fi
 
+# --Management address and branches-------------------------------------------
+BRANCHES_OK=0
+if [[ -n "${DARKNET_NETS:-}" ]]; then
+    [[ -n "${MGMT_ADDR:-}" ]] || warn "MGMT_ADDR is not set in ${ENV_FILE}: this node's own traffic is not kept out of the capture (re-run setup.sh)"
+    if SUMMARY=$(python3 "${HELPERS_DIR}/branches.py" check "${DARKNET_NETS}" --mgmt "${MGMT_ADDR:-}" \
+                     --irregular "${R_IRREGULAR_ADDRS:-}" --regular "${R_REGULAR_ADDRS:-}" 2>&1); then
+        ok "Branches: ${SUMMARY}"
+        BRANCHES_OK=1
+        if [[ -n "${BRANCH_NETS:-}" ]] && ! python3 "${HELPERS_DIR}/darknet.py" same "${BRANCH_NETS}" "${DARKNET_NETS}"; then
+            warn "DARKNET_NETS changed since the branches were drawn (for ${BRANCH_NETS}): any new address is passive"
+        fi
+    else
+        err "Branches in ${ENV_FILE} are invalid: ${SUMMARY}"
+        ERRORS=$(( ERRORS + 1 ))
+    fi
+fi
+
 # --SSH connectivity----------------------------------------------------------
 REMOTE="${REMOTE_HOST:-}"
 if [[ -n "${REMOTE}" && "${REMOTE}" != "CHANGE_ME" ]]; then
@@ -128,6 +145,20 @@ check_or_start_service nt-capture
 check_or_start_service nt-file-detector
 check_or_start_service nt-sweep.timer
 check_or_start_service prometheus-node-exporter
+
+# --Branch assignment for the processing node---------------------------------
+# Sent with the PCAP files (the file detector picks it up). The same assignment is the same file again, which the
+# processing node ignores, so it is simply written on every run.
+if [[ ${BRANCHES_OK} -eq 1 && "${TRANSFER_MODE:-local}" == "remote" && -d "${RAW_DIR}" ]]; then
+    if MANIFEST=$(python3 "${HELPERS_DIR}/branches.py" manifest "${DARKNET_NETS}" --mgmt "${MGMT_ADDR:-}" \
+                      --irregular "${R_IRREGULAR_ADDRS:-}" --regular "${R_REGULAR_ADDRS:-}" --seed "${BRANCH_SEED:-0}" --out-dir "${RAW_DIR}"); then
+        chown "${NT_USER}:${NT_GROUP}" "${MANIFEST}" 2>/dev/null || true
+        ok "Branch assignment queued for the processing node: $(basename "${MANIFEST}")"
+    else
+        err "Could not write the branch assignment to ${RAW_DIR}"
+        ERRORS=$(( ERRORS + 1 ))
+    fi
+fi
 
 # --dumpcap process check-----------------------------------------------------
 if pgrep -x dumpcap &>/dev/null; then

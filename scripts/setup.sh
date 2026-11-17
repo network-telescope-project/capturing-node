@@ -21,6 +21,14 @@ ok()   { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[i]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[!]\033[0m ERROR: $*" >&2; }
 env_value() { grep "^$1=" "${ENV_FILE}" | tail -1 | cut -d= -f2- | tr -d "\"' " || true; }
+set_env() {
+    if grep -q "^$1=" "${ENV_FILE}"; then
+        sed -i "s|^$1=.*|$1=$2|" "${ENV_FILE}"
+    else
+        [[ -z "$(tail -c1 "${ENV_FILE}")" ]] || echo >> "${ENV_FILE}"
+        echo "$1=$2" >> "${ENV_FILE}"
+    fi
+}
 require_root() {
     if [[ $EUID -ne 0 ]]; then
        err "This script must be run as root (use sudo)."
@@ -45,6 +53,14 @@ require_root() {
 
 # --Pre flight----------------------------------------------------------------
 require_root
+
+REDRAW_BRANCHES=0
+if [[ "${1:-}" == "--redraw-branches" ]]; then
+    REDRAW_BRANCHES=1
+elif [[ $# -gt 0 ]]; then
+    err "usage: sudo $0 [--redraw-branches]"
+    exit 1
+fi
 
 OS=$(. /etc/os-release && echo "${ID}")
 if [[ ! "${OS}" =~ ^(ubuntu|debian)$ ]]; then
@@ -307,6 +323,57 @@ else
     warn "Interface '${IFACE}' not found: DARKNET_NETS not detected. Fix INTERFACE in ${ENV_FILE} and re-run setup.sh."
 fi
 
+# --Management address-----------------------------------------------------
+MGMT_ADDR=$(env_value MGMT_ADDR)
+if [[ -z "${MGMT_ADDR}" ]]; then
+    MGMT_ADDR=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
+    if is_valid_ip "${MGMT_ADDR}"; then
+        set_env MGMT_ADDR "${MGMT_ADDR}"
+    else
+        MGMT_ADDR=""
+        warn "Could not detect this node's own address: set MGMT_ADDR in ${ENV_FILE} by hand and re-run setup.sh."
+    fi
+fi
+[[ -z "${MGMT_ADDR}" ]] || ok "Management address: ${MGMT_ADDR}"
+
+SSH_PORTS=$(ss -ltnpH | awk '/"sshd"/ {n=split($4, a, ":"); print a[n]}' | sort -u)
+if [[ -n "${SSH_PORTS}" ]]; then
+    set_env MGMT_PORTS "$(echo ${SSH_PORTS} 9100 | tr ' ' ',')"     # sshd + node-exporter
+elif [[ -z "$(env_value MGMT_PORTS)" ]]; then
+    set_env MGMT_PORTS "22,9100"
+    warn "Could not find the port sshd listens on: assuming 22 for MGMT_PORTS in ${ENV_FILE}."
+fi
+
+# --Branches---------------------------------------------------------------
+NETS=$(env_value DARKNET_NETS)
+if [[ -n "${NETS}" ]]; then
+    branches() { python3 "${PROJECT_ROOT}/helpers/branches.py" "$@"; }
+    if [[ -z "$(env_value BRANCH_SEED)" || ${REDRAW_BRANCHES} -eq 1 ]]; then
+        rc=0
+        DRAWN=$(branches draw "${NETS}" --mgmt "${MGMT_ADDR}") || rc=$?
+        if [[ ${rc} -eq 3 ]]; then
+            DRAWN=$'BRANCH_SEED=\nBRANCH_NETS=\nR_IRREGULAR_ADDRS=\nR_REGULAR_ADDRS='
+            warn "Too few addresses in DARKNET_NETS to answer on any: all stay passive. The branches are drawn once setup.sh runs with more."
+        elif [[ ${rc} -ne 0 ]]; then
+            err "Could not draw the branches for DARKNET_NETS=${NETS}"
+            exit 1
+        fi
+        while IFS='=' read -r key value; do
+            set_env "${key}" "${value}"
+        done <<< "${DRAWN}"
+        [[ ${rc} -ne 0 ]] || ok "Branches drawn at random (seed $(env_value BRANCH_SEED)) and written to ${ENV_FILE}"
+    elif ! python3 "${PROJECT_ROOT}/helpers/darknet.py" same "$(env_value BRANCH_NETS)" "${NETS}"; then
+        warn "DARKNET_NETS changed since the branches were drawn (for $(env_value BRANCH_NETS)): the answered addresses stay"
+        warn "  as they are and any new address is passive. To draw again: sudo $0 --redraw-branches"
+    fi
+    if SUMMARY=$(branches check "${NETS}" --mgmt "${MGMT_ADDR}" --irregular "$(env_value R_IRREGULAR_ADDRS)" --regular "$(env_value R_REGULAR_ADDRS)" 2>&1); then
+        ok "Branches: ${SUMMARY}"
+    else
+        err "Branches in ${ENV_FILE} are invalid: ${SUMMARY}"
+        exit 1
+    fi
+fi
+
 # --Prometheus node exporter tuning----------------------------------------
 log "Configuring prometheus-node-exporter..."
 PROM_OVERRIDE_DIR="/etc/systemd/system/prometheus-node-exporter.service.d"
@@ -435,7 +502,6 @@ else
     fi
 
     # --Firewall---------------------------------------------------------------
-    SSH_PORTS=$(ss -ltnpH | awk '/"sshd"/ {n=split($4, a, ":"); print a[n]}' | sort -u)
     if [[ -z "${SSH_PORTS}" ]]; then
         warn "Could not find the port sshd listens on: not enabling the firewall."
     else
@@ -443,7 +509,11 @@ else
         ufw default deny incoming > /dev/null
         ufw default allow outgoing > /dev/null
         for port in ${SSH_PORTS}; do
-            ufw allow "${port}/tcp" comment "nt-ssh" > /dev/null
+            if [[ -n "${MGMT_ADDR}" ]]; then
+                ufw allow proto tcp to "${MGMT_ADDR}" port "${port}" comment "nt-ssh" > /dev/null
+            else
+                ufw allow "${port}/tcp" comment "nt-ssh" > /dev/null
+            fi
         done
         ufw allow proto tcp from "${REMOTE_HOST}" to any port 9100 comment "nt-prometheus" > /dev/null   # node-exporter
 

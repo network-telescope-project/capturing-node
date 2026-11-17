@@ -94,7 +94,7 @@ if [[ -n "${DETECTOR_CPUS}" ]]; then
 fi
 
 "${INOTIFY_CMD[@]}" | while IFS= read -r filepath; do
-    [[ "${filepath}" == *.pcap ]] || continue
+    [[ "${filepath}" == *.pcap || "${filepath##*/}" == branches_*.tsv ]] || continue
 
     log_info "Closed: ${filepath}"
     transfer_file "${filepath}" || log_err "ERROR: transfer_file failed for ${filepath}"

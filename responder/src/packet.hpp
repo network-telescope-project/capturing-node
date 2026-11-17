@@ -44,10 +44,11 @@ const uint8_t* skip_link_header(int linktype, const uint8_t* frame, uint32_t cap
 
 ParseResult parse_ipv4_tcp(const uint8_t* ip, uint32_t caplen, TcpPacket& out);
 
-enum class SynAckProfile { kSpoki, kRegular };
+// irregular: no TCP options, window 65535 (what Spoki sends); regular: shaped like a Linux SYN-ACK
+enum class SynAckProfile { kIrregular, kRegular };
 
 struct CraftParams {
-    SynAckProfile profile = SynAckProfile::kSpoki;
+    SynAckProfile profile = SynAckProfile::kIrregular;
     uint8_t ttl = 64;
 };
 

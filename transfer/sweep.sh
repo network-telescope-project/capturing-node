@@ -68,14 +68,19 @@ send_file() {
     return "${rc}"
 }
 
-mapfile -t files < <(find "${DATA_DIR}" -maxdepth 1 -type f -name '*.pcap' -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
+mapfile -t files < <(find "${DATA_DIR}" -maxdepth 1 -type f \( -name '*.pcap' -o -name 'branches_*.tsv' \) -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
 
 if [[ ${#files[@]} -eq 0 ]]; then
     log_info "No PCAP files in ${DATA_DIR}"
     exit 0
 fi
 
-newest="${files[-1]}"
+newest=""
+for filepath in "${files[@]}"; do
+    if [[ "${filepath}" == *.pcap ]]; then
+        newest="${filepath}"
+    fi
+done
 dumpcap_running=0
 pgrep -x dumpcap >/dev/null && dumpcap_running=1
 

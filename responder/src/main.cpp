@@ -25,7 +25,7 @@ const char* kUsage =
     "  --duration S             start a new output file every S seconds (default 3600)\n"
     "  --files N                keep at most N output files, 0 = no limit (default 0)\n"
     "  --payload-max N          payload bytes kept per recorded packet, 0 = all (default 0)\n"
-    "  --synack-profile P       spoki (no options, window 65535) | regular (Linux-like) (default spoki)\n"
+    "  --synack-profile P       irregular (no options, window 65535, as Spoki) | regular (Linux-like) (default irregular)\n"
     "  --ttl N                  TTL of our packets (default 64)\n"
     "  --rst-delay S            seconds from the peer's ACK to our RST (default 5)\n"
     "  --rst-count N            RSTs sent per connection (default 2)\n"
@@ -92,9 +92,9 @@ int main(int argc, char** argv) {
             if (end == v || *end || !(s >= 0 && s <= 3600)) die("invalid value for --rst-delay: " + std::string(v));
             cfg.rst_delay = nt::TimeNs(s * 1e9);
         } else if (opt == "--synack-profile") {
-            if (std::strcmp(v, "spoki") == 0) cfg.craft.profile = nt::SynAckProfile::kSpoki;
+            if (std::strcmp(v, "irregular") == 0) cfg.craft.profile = nt::SynAckProfile::kIrregular;
             else if (std::strcmp(v, "regular") == 0) cfg.craft.profile = nt::SynAckProfile::kRegular;
-            else die("--synack-profile must be spoki or regular");
+            else die("--synack-profile must be irregular or regular");
         } else {
             die("unknown option " + opt);
         }

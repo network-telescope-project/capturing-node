@@ -9,24 +9,27 @@ RING_BUFFER_SIZE="${RING_BUFFER_SIZE:-24}"
 CAPTURE_CPUS="${CAPTURE_CPUS:-}"
 TRANSFER_MODE="${TRANSFER_MODE:-local}"
 DARKNET_NETS="${DARKNET_NETS:-}"
+MGMT_ADDR="${MGMT_ADDR:-}"
+MGMT_PORTS="${MGMT_PORTS:-}"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 HELPERS_DIR="$(dirname "${SCRIPT_DIR}")/helpers"
 
 if [[ -n "${DARKNET_NETS}" ]]; then
-    DARKNET_FILTER="$(python3 "${HELPERS_DIR}/darknet.py" filter "${DARKNET_NETS}")"
+    DARKNET_FILTER="$(python3 "${HELPERS_DIR}/darknet.py" filter "${DARKNET_NETS}" "${MGMT_ADDR}" "${MGMT_PORTS}")"
+    PROTO_FILTER="tcp"
 elif [[ "${TRANSFER_MODE}" == "remote" ]]; then
     echo "[capture] ERROR: DARKNET_NETS is empty - set it in the .env file" >&2
     exit 1
 else
-    echo "[capture] WARNING: DARKNET_NETS is empty - not filtering on the destination (local mode only)"
+    echo "[capture] WARNING: DARKNET_NETS is empty - not filtering on the destination, SYNs only (local mode only)"
     DARKNET_FILTER=""
+    PROTO_FILTER="tcp[tcpflags] & (tcp-syn) != 0 and tcp[tcpflags] & (tcp-ack) == 0"
 fi
 
 EXCLUDE_SRC="not (src net 10.0.0.0/8 or src net 172.16.0.0/12 or src net 192.168.0.0/16 or src net 169.254.0.0/16 or src net 127.0.0.0/8)"
 if ip -6 addr show "$INTERFACE" scope global >/dev/null 2>&1; then
     EXCLUDE_SRC="$EXCLUDE_SRC and not (src net fc00::/7 or src net ::1/128)"
 fi
-PROTO_FILTER="tcp[tcpflags] & (tcp-syn) != 0 and tcp[tcpflags] & (tcp-ack) == 0"
 
 # Optimized clause order building to utilize BPF filter's short-circuit evaluation
 FILTER="(${PROTO_FILTER})"
