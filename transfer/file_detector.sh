@@ -5,7 +5,7 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/var/lib/network-telescope/data/raw}"
 TRANSFER_MODE="${TRANSFER_MODE:-local}"
 REMOTE_USER="${REMOTE_USER:-telescope}"
-REMOTE_HOST="${REMOTE_HOST:-}"
+TUNNEL_HOST="${WG_REMOTE_ADDR:-}"
 REMOTE_PORT="${REMOTE_PORT:-8500}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
 SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10"
@@ -31,8 +31,8 @@ transfer_file() {
         return 0
     fi
 
-    if [[ -z "${REMOTE_HOST}" ]]; then
-        log_err "ERROR: REMOTE_HOST not set but TRANSFER_MODE=remote"
+    if [[ -z "${TUNNEL_HOST}" ]]; then
+        log_err "ERROR: WG_REMOTE_ADDR not set (tunnel not configured, run setup.sh) but TRANSFER_MODE=remote"
         return 1
     fi
 
@@ -40,7 +40,7 @@ transfer_file() {
     local rc
     while [[ ${attempt} -lt ${MAX_RETRIES} ]]; do
         attempt=$(( attempt + 1 ))
-        log_info "Transferring ${filename} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT} (attempt ${attempt})"
+        log_info "Transferring ${filename} to ${REMOTE_USER}@${TUNNEL_HOST}:${REMOTE_PORT} (attempt ${attempt})"
 
         rc=0
         (
@@ -51,7 +51,7 @@ transfer_file() {
             rsync -az --checksum \
                 -e "${SSH_CMD}" \
                 "${filepath}" \
-                "${REMOTE_USER}@${REMOTE_HOST}:./" || exit 1
+                "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1     # ".", not "./": rrsync refuses "./"
 
             rm -f "${filepath}"
         ) 9>"${TRANSFER_LOCK}" || rc=$?
@@ -85,7 +85,7 @@ trap 'rm -f "${LOCK_FILE}"; log_info "Stopped."' EXIT
 mkdir -p "${DATA_DIR}"
 
 log_info "Watching '${DATA_DIR}' for closed PCAP files (mode=${TRANSFER_MODE})"
-[[ "${TRANSFER_MODE}" == "remote" ]] && log_info "Remote target: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
+[[ "${TRANSFER_MODE}" == "remote" ]] && log_info "Remote target: ${REMOTE_USER}@${TUNNEL_HOST}:${REMOTE_PORT}"
 
 INOTIFY_CMD=(inotifywait -m -e close_write -q --format '%w%f' "${DATA_DIR}")
 if [[ -n "${DETECTOR_CPUS}" ]]; then

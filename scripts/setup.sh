@@ -15,6 +15,21 @@ SSH_DIR="${NT_HOME}/.ssh"
 CONF_DIR="/etc/network-telescope"
 ENV_FILE="${CONF_DIR}/capturing-node.env"
 
+# WireGuard tunnel to the processing node (the transfer and the metrics go through it)
+WG_IF="wg-nt"
+WG_CONF="/etc/wireguard/${WG_IF}.conf"
+WG_KEY="/etc/wireguard/${WG_IF}.key"
+WG_MTU=1280                         # leaves room for the WireGuard and the TCP wrapper headers
+WG_WRAPPER_LISTEN="127.0.0.1:51820" # the local end of the wstunnel client (nt-wstunnel.service), WireGuard's Endpoint
+
+# wstunnel (carries WireGuard over TCP): pinned release and the checksums published with it
+WSTUNNEL_VERSION="11.1.0"
+declare -A WSTUNNEL_SHA256=(
+    [amd64]="512edf4e7bb64fc133522220123514868fae75b5bae4124b53e396787276aa23"
+    [arm64]="148895f957a68be39e2b65d28c5f2065b9c58c4a0cfd48c560b2b3267f398464"
+)
+WSTUNNEL_BIN="/usr/local/bin/wstunnel"
+
 # --Helpers-------------------------------------------------------------------
 log()  { echo "[*] $*"; }
 ok()   { echo -e "\033[1;32m[+]\033[0m $*"; }
@@ -51,6 +66,30 @@ require_root() {
     return $stat
 }
 
+install_wstunnel() {
+    if [[ "$("${WSTUNNEL_BIN}" --version 2>/dev/null)" == "wstunnel-cli ${WSTUNNEL_VERSION}" ]]; then
+        ok "wstunnel ${WSTUNNEL_VERSION} installed."
+        return
+    fi
+    local arch sha tmp
+    arch=$(dpkg --print-architecture)
+    sha="${WSTUNNEL_SHA256[${arch}]:-}"
+    [[ -n "${sha}" ]] || { err "No pinned wstunnel build for architecture '${arch}'."; exit 1; }
+    tmp=$(mktemp -d)
+    log "Installing wstunnel ${WSTUNNEL_VERSION} (${arch})..."
+    if ! curl -fsSL --retry 3 -o "${tmp}/wstunnel.tar.gz" \
+            "https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_${arch}.tar.gz" \
+        || ! echo "${sha}  ${tmp}/wstunnel.tar.gz" | sha256sum -c --quiet; then
+        rm -rf "${tmp}"
+        err "wstunnel download failed or its checksum does not match - not installed."
+        exit 1
+    fi
+    tar -xzf "${tmp}/wstunnel.tar.gz" -C "${tmp}" wstunnel
+    install -m 755 -o root -g root "${tmp}/wstunnel" "${WSTUNNEL_BIN}"
+    rm -rf "${tmp}"
+    ok "wstunnel ${WSTUNNEL_VERSION} installed: ${WSTUNNEL_BIN}"
+}
+
 # --Pre flight----------------------------------------------------------------
 require_root
 
@@ -75,7 +114,7 @@ if [[ "${PROJECT_ROOT}" == /home/* || "${PROJECT_ROOT}" == /root/* ]]; then
 fi
 
 # --Dependencies--------------------------------------------------------------
-SYSTEM_DEPS=("wireshark-common" "python3" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq" "ufw")
+SYSTEM_DEPS=("wireshark-common" "python3" "inotify-tools" "psmisc" "prometheus-node-exporter" "openssh-client" "rsync" "ethtool" "util-linux" "cpufrequtils" "net-tools" "procps" "curl" "jq" "ufw" "wireguard-tools")
 MISSING_DEPS=()
 
 log "Auditing CAPTURE node dependencies..."
@@ -419,6 +458,14 @@ else
     warn "SSH key already exists: ${SSH_DIR}/id_ed25519"
 fi
 
+# --WireGuard key----------------------------------------------------------
+install -d -m 700 /etc/wireguard
+if [[ ! -f "${WG_KEY}" ]]; then
+    (umask 077 && wg genkey > "${WG_KEY}")
+    log "WireGuard key generated: ${WG_KEY}"
+fi
+WG_PUBKEY=$(wg pubkey < "${WG_KEY}")
+
 # --Systemd services-------------------------------------------------------
 log "Installing systemd unit files..."
 UNIT_FILES=(
@@ -462,6 +509,7 @@ REMOTE_HOST=$(env_value REMOTE_HOST)
 REMOTE_PORT=$(env_value REMOTE_PORT)
 REMOTE_PORT="${REMOTE_PORT:-8500}"
 KNOWN_HOSTS="${SSH_DIR}/known_hosts"
+TUNNEL_LINE='^nt-tunnel addr=([0-9.]+) server=([0-9.]+) key=([A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=) port=([0-9]{1,5}) wrapper=(tcp|none)$'
 
 if ! is_valid_ip "${REMOTE_HOST}"; then
     warn "REMOTE_HOST is not set in ${ENV_FILE}: skipping registration and firewall. Set it and re-run setup.sh"
@@ -471,34 +519,119 @@ else
 
     NETS=$(env_value DARKNET_NETS)
     [[ -n "${NETS}" ]] || warn "DARKNET_NETS is empty: replace <DARKNET_NETS> in the command below (comma separated)."
-    echo ""
-    warn "Register this node (run on the processing node):"
-    echo "  sudo /opt/network-telescope/scripts/add-sensor.sh ${NODE_IP} \"${NETS:-<DARKNET_NETS>}\" \"$(cat "${SSH_DIR}/id_ed25519.pub")\""
-    echo ""
-    read -r -p "Press Enter once it has run there (or type 's' to skip and re-run setup.sh later): " ANSWER
+    REGISTER_CMD="sudo /opt/network-telescope/scripts/add-sensor.sh ${NODE_IP} \"${NETS:-<DARKNET_NETS>}\" \"$(cat "${SSH_DIR}/id_ed25519.pub")\" \"${WG_PUBKEY}\""
 
-    # Pin the processing node's host key
-    if ssh-keygen -F "[${REMOTE_HOST}]:${REMOTE_PORT}" -f "${KNOWN_HOSTS}" &>/dev/null; then
-        ok "Processing node host key already pinned."
-    elif [[ "${ANSWER}" == "s" ]]; then
-        warn "Host key not pinned yet: re-run setup.sh after registering this node."
+    if [[ -z "$(env_value WG_ADDR)" || -z "$(env_value WG_REMOTE_ADDR)" || -z "$(env_value WG_REMOTE_PUBKEY)" ]]; then
+        echo ""
+        warn "Register this node (run on the processing node):"
+        echo "  ${REGISTER_CMD}"
+        echo ""
+        while true; do
+            read -r -p "Paste the 'nt-tunnel ...' line it printed (or type 's' to skip and re-run setup.sh later): " LINE
+            LINE=$(sed -e 's/\r//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "${LINE}")
+            [[ "${LINE}" == "s" ]] && break
+            if [[ "${LINE}" =~ ${TUNNEL_LINE} ]]; then
+                T_ADDR="${BASH_REMATCH[1]}"; T_SERVER="${BASH_REMATCH[2]}"; T_KEY="${BASH_REMATCH[3]}"
+                T_PORT="${BASH_REMATCH[4]}"; T_WRAPPER="${BASH_REMATCH[5]}"
+                if is_valid_ip "${T_ADDR}" && is_valid_ip "${T_SERVER}"; then
+                    set_env WG_ADDR "${T_ADDR}"
+                    set_env WG_REMOTE_ADDR "${T_SERVER}"
+                    set_env WG_REMOTE_PUBKEY "${T_KEY}"
+                    set_env WG_PORT "${T_PORT}"
+                    set_env WG_WRAPPER "${T_WRAPPER}"
+                    ok "Tunnel settings written to ${ENV_FILE}"
+                    break
+                fi
+            fi
+            err "That is not the 'nt-tunnel addr=... server=... key=... port=... wrapper=...' line - try again."
+        done
     else
-        HOST_KEY=$(ssh-keyscan -T 10 -p "${REMOTE_PORT}" -t ed25519 "${REMOTE_HOST}" 2>/dev/null || true)
-        if [[ -z "${HOST_KEY}" ]]; then
-            warn "No answer from ${REMOTE_HOST}:${REMOTE_PORT} (node not registered yet, or blocked): re-run setup.sh to pin its host key."
+        ok "Registered on the processing node (tunnel address $(env_value WG_ADDR))."
+        log "  Only if this node's public address or keys changed, run there again: ${REGISTER_CMD}"
+    fi
+
+    WG_ADDR=$(env_value WG_ADDR)
+    WG_REMOTE_ADDR=$(env_value WG_REMOTE_ADDR)
+    WG_REMOTE_PUBKEY=$(env_value WG_REMOTE_PUBKEY)
+    WG_PORT=$(env_value WG_PORT)
+    WG_WRAPPER=$(env_value WG_WRAPPER)
+    if [[ -n "${WG_ADDR}" && -n "${WG_REMOTE_ADDR}" && -n "${WG_REMOTE_PUBKEY}" ]]; then
+        if [[ ! "${WG_WRAPPER}" =~ ^(tcp|none)$ || ! "${WG_PORT}" =~ ^[0-9]+$ ]]; then
+            err "WG_WRAPPER must be tcp or none and WG_PORT a port number (${ENV_FILE})."
+            exit 1
+        fi
+
+        # The wrapper: WireGuard sends to the local wstunnel client, which carries it over TCP
+        if [[ "${WG_WRAPPER}" == "tcp" ]]; then
+            install_wstunnel
+            install -m 644 "${PROJECT_ROOT}/transfer/nt-wstunnel.service" /etc/systemd/system/nt-wstunnel.service
+            systemctl daemon-reload
+            systemctl enable nt-wstunnel > /dev/null 2>&1
+            systemctl restart nt-wstunnel
+            ENDPOINT="${WG_WRAPPER_LISTEN}"
+            ok "wstunnel client up: WireGuard goes over TCP to ${REMOTE_HOST}:${WG_PORT}"
         else
-            echo "SSH host key offered by ${REMOTE_HOST}:${REMOTE_PORT}:"
-            ssh-keygen -lf /dev/stdin <<< "${HOST_KEY}"
-            read -r -p "Does it match the fingerprint printed at the end of setup.sh on the processing node? [y/N] " ANSWER
-            if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
-                echo "${HOST_KEY}" >> "${KNOWN_HOSTS}"
-                chown "${NT_USER}:${NT_GROUP}" "${KNOWN_HOSTS}"
-                chmod 644 "${KNOWN_HOSTS}"
-                ok "Host key pinned in ${KNOWN_HOSTS}"
+            if [[ -f /etc/systemd/system/nt-wstunnel.service ]]; then
+                systemctl disable --now nt-wstunnel > /dev/null 2>&1 || true
+                rm -f /etc/systemd/system/nt-wstunnel.service
+                systemctl daemon-reload
+            fi
+            ENDPOINT="${REMOTE_HOST}:${WG_PORT}"
+        fi
+
+        (umask 077 && cat > "${WG_CONF}" <<EOF
+# Written by setup.sh from the WG_* settings in ${ENV_FILE}: change those and re-run setup.sh
+[Interface]
+Address = ${WG_ADDR}/32
+MTU = ${WG_MTU}
+PostUp = wg set %i private-key ${WG_KEY}
+
+[Peer]
+PublicKey = ${WG_REMOTE_PUBKEY}
+AllowedIPs = ${WG_REMOTE_ADDR}/32
+Endpoint = ${ENDPOINT}
+PersistentKeepalive = 25
+EOF
+        )
+        systemctl enable "wg-quick@${WG_IF}" > /dev/null 2>&1
+        systemctl restart "wg-quick@${WG_IF}"
+        log "Waiting for the tunnel to the processing node..."
+        HANDSHAKE=0
+        for _ in $(seq 1 30); do
+            HANDSHAKE=$(wg show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2; exit}') || true
+            [[ "${HANDSHAKE:-0}" -gt 0 ]] && break
+            sleep 1
+        done
+        if [[ "${HANDSHAKE:-0}" -gt 0 ]]; then
+            ok "Tunnel up: ${WG_ADDR} <-> ${WG_REMOTE_ADDR} (wrapper: ${WG_WRAPPER})"
+        else
+            warn "No answer through the tunnel yet: is this node registered there with this WireGuard key, and does"
+            warn "  WG_WRAPPER match the processing node's? (journalctl -u nt-wstunnel; wg show ${WG_IF})"
+        fi
+
+        # Pin the processing node's host key, as seen through the tunnel
+        if ssh-keygen -F "[${WG_REMOTE_ADDR}]:${REMOTE_PORT}" -f "${KNOWN_HOSTS}" &>/dev/null; then
+            ok "Processing node host key already pinned."
+        else
+            HOST_KEY=$(ssh-keyscan -T 10 -p "${REMOTE_PORT}" -t ed25519 "${WG_REMOTE_ADDR}" 2>/dev/null || true)
+            if [[ -z "${HOST_KEY}" ]]; then
+                warn "No answer from ${WG_REMOTE_ADDR}:${REMOTE_PORT} through the tunnel: re-run setup.sh to pin its host key."
             else
-                err "Host key NOT pinned - fingerprint differs."
+                echo "SSH host key offered by ${WG_REMOTE_ADDR}:${REMOTE_PORT}:"
+                ssh-keygen -lf /dev/stdin <<< "${HOST_KEY}"
+                read -r -p "Does it match the fingerprint printed at the end of setup.sh on the processing node? [y/N] " ANSWER
+                if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+                    echo "${HOST_KEY}" >> "${KNOWN_HOSTS}"
+                    chown "${NT_USER}:${NT_GROUP}" "${KNOWN_HOSTS}"
+                    chmod 644 "${KNOWN_HOSTS}"
+                    ok "Host key pinned in ${KNOWN_HOSTS}"
+                else
+                    err "Host key NOT pinned - fingerprint differs."
+                fi
             fi
         fi
+    else
+        warn "Tunnel not configured yet: re-run setup.sh after registering this node."
     fi
 
     # --Firewall---------------------------------------------------------------
@@ -515,9 +648,13 @@ else
                 ufw allow "${port}/tcp" comment "nt-ssh" > /dev/null
             fi
         done
-        ufw allow proto tcp from "${REMOTE_HOST}" to any port 9100 comment "nt-prometheus" > /dev/null   # node-exporter
+        if [[ -n "${WG_REMOTE_ADDR}" ]]; then
+            # node-exporter: scraped by the processing node through the tunnel only
+            ufw allow in on "${WG_IF}" proto tcp from "${WG_REMOTE_ADDR}" to any port 9100 comment "nt-prometheus" > /dev/null
+        fi
 
-        if ufw status | grep -q "^Status: active"; then
+        # Not "ufw status | grep -q": with pipefail, grep stopping early can make an active firewall look inactive
+        if [[ "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
             ok "Firewall already active - rules updated."
         else
             systemd-run --quiet --unit=nt-ufw-rollback --on-active=5min /usr/sbin/ufw disable
@@ -541,7 +678,7 @@ ok "Capture node setup is done."
 echo ""
 echo -e "\033[1;33mNext steps:\033[0m"
 echo -e "\033[1;33m   1. Edit ${ENV_FILE}\033[0m"
-echo -e "\033[1;33m   2. If you skipped the registration: re-run setup.sh once REMOTE_HOST is set and the node is registered\033[0m"
+echo -e "\033[1;33m   2. If you skipped the registration: re-run setup.sh once REMOTE_HOST is set, and paste the line add-sensor.sh prints\033[0m"
 echo -e "\033[1;33m   3. Run: sudo ./scripts/start.sh\033[0m"
 echo ""
 warn "RING_BUFFER_SIZE (default 24) = max PCAP files kept on this node, one per DURATION (default 1 h)."

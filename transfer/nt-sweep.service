@@ -1,7 +1,7 @@
 [Unit]
 Description=Network Telescope Sweep Service of Unsent PCAP Files
-After=network-online.target
-Wants=network-online.target
+After=network-online.target wg-quick@wg-nt.service
+Wants=network-online.target wg-quick@wg-nt.service
 
 [Service]
 Type=oneshot

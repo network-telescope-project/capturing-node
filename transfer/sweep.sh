@@ -14,7 +14,7 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/var/lib/network-telescope/data/raw}"
 TRANSFER_MODE="${TRANSFER_MODE:-local}"
 REMOTE_USER="${REMOTE_USER:-telescope}"
-REMOTE_HOST="${REMOTE_HOST:-}"
+TUNNEL_HOST="${WG_REMOTE_ADDR:-}"    # the processing node, through the WireGuard tunnel
 REMOTE_PORT="${REMOTE_PORT:-8500}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
 SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10"
@@ -32,8 +32,8 @@ if [[ "${TRANSFER_MODE}" != "remote" ]]; then
     log_info "TRANSFER_MODE=${TRANSFER_MODE}, nothing to do"
     exit 0
 fi
-if [[ -z "${REMOTE_HOST}" ]]; then
-    log_err "ERROR: REMOTE_HOST not set but TRANSFER_MODE=remote"
+if [[ -z "${TUNNEL_HOST}" ]]; then
+    log_err "ERROR: WG_REMOTE_ADDR not set (tunnel not configured, run setup.sh) but TRANSFER_MODE=remote"
     exit 1
 fi
 if ! command -v fuser >/dev/null; then
@@ -54,7 +54,7 @@ send_file() {
         rsync -az --checksum \
             -e "${SSH_CMD}" \
             "${filepath}" \
-            "${REMOTE_USER}@${REMOTE_HOST}:./" || exit 1
+            "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1
 
         rm -f "${filepath}"
     ) 9>"${TRANSFER_LOCK}" || rc=$?

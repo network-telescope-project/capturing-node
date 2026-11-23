@@ -118,9 +118,43 @@ if [[ -n "${DARKNET_NETS:-}" ]]; then
     fi
 fi
 
-# --SSH connectivity----------------------------------------------------------
-REMOTE="${REMOTE_HOST:-}"
-if [[ -n "${REMOTE}" && "${REMOTE}" != "CHANGE_ME" ]]; then
+# --Tunnel to the processing node---------------------------------------------
+WG_IF="wg-nt"
+HANDSHAKE_MAX_AGE=180       # keepalive every 25 s; WireGuard renews the handshake every 2 min
+REMOTE="${WG_REMOTE_ADDR:-}"
+if [[ "${TRANSFER_MODE:-local}" == "remote" ]]; then
+    if [[ -z "${REMOTE}" || -z "${WG_ADDR:-}" ]]; then
+        err "Tunnel to the processing node not configured (WG_ADDR / WG_REMOTE_ADDR in ${ENV_FILE}) - re-run setup.sh"
+        ERRORS=$(( ERRORS + 1 ))
+    else
+        echo ""
+        if [[ "${WG_WRAPPER:-tcp}" == "tcp" ]]; then
+            check_or_start_service nt-wstunnel
+        fi
+        check_or_start_service "wg-quick@${WG_IF}"
+        LAST=$(wg show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2; exit}') || true
+        for _ in $(seq 1 15); do       # just (re)started: give it a moment
+            [[ "${LAST:-0}" -gt 0 ]] && break
+            sleep 1
+            LAST=$(wg show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2; exit}') || true
+        done
+        AGE=$(( $(date +%s) - ${LAST:-0} ))
+        if [[ "${LAST:-0}" -eq 0 ]]; then
+            HINT="'wg show ${WG_IF}'"
+            [[ "${WG_WRAPPER:-tcp}" != "tcp" ]] || HINT="journalctl -u nt-wstunnel and ${HINT}"
+            err "Tunnel: no handshake with the processing node (wrapper: ${WG_WRAPPER:-tcp}) - check ${HINT}"
+            ERRORS=$(( ERRORS + 1 ))
+        elif [[ ${AGE} -gt ${HANDSHAKE_MAX_AGE} ]]; then
+            err "Tunnel: last handshake ${AGE} s ago - the processing node or the path to it is down"
+            ERRORS=$(( ERRORS + 1 ))
+        else
+            ok "Tunnel: ${WG_ADDR} <-> ${REMOTE} up (handshake ${AGE} s ago, wrapper: ${WG_WRAPPER:-tcp})"
+        fi
+    fi
+fi
+
+# --SSH connectivity (through the tunnel)-------------------------------------
+if [[ -n "${REMOTE}" ]]; then
     SSH_KEY="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
     KNOWN_HOSTS="${SSH_KEY%/*}/known_hosts"
     PORT="${REMOTE_PORT:-8500}"
@@ -129,14 +163,14 @@ if [[ -n "${REMOTE}" && "${REMOTE}" != "CHANGE_ME" ]]; then
         ERRORS=$(( ERRORS + 1 ))
     elif sudo -u ${NT_USER} rsync -rn --exclude='*' \
            -e "ssh -i ${SSH_KEY} -p ${PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o ConnectTimeout=5" \
-           "${RAW_DIR}/" "${REMOTE_USER:-telescope}@${REMOTE}:./" &>/dev/null; then
+           "${RAW_DIR}/" "${REMOTE_USER:-telescope}@${REMOTE}:." &>/dev/null; then
         ok "Delivery to processing node (${REMOTE}:${PORT}) OK"
     else
-        err "Cannot deliver to processing node (${REMOTE}:${PORT}) - was add-sensor.sh run there for this node (key, IP)? Check REMOTE_HOST/REMOTE_PORT"
+        err "Cannot deliver to processing node (${REMOTE}:${PORT}) - is the tunnel up and was add-sensor.sh run there with this node's keys?"
         ERRORS=$(( ERRORS + 1 ))
     fi
 else
-    warn "REMOTE_HOST not set - skipping SSH check (local mode?)"
+    warn "No tunnel configured - skipping the delivery check (local mode?)"
 fi
 
 # --Services------------------------------------------------------------------
