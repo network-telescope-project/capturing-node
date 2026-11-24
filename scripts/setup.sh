@@ -159,7 +159,7 @@ MISSING_DEPS=()
 log "Auditing CAPTURE node dependencies..."
 
 for pkg in "${SYSTEM_DEPS[@]}"; do
-    if ! dpkg -l | grep -q "ii  $pkg "; then
+    if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null)" != "installed" ]]; then
         MISSING_DEPS+=("$pkg")
     fi
 done
@@ -167,7 +167,7 @@ done
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     warn "Missing: ${MISSING_DEPS[*]}"
     log "Updating package lists and installing missing dependencies..."
-    apt-get update -qq && apt-get install -y -qq "${MISSING_DEPS[@]}"
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${MISSING_DEPS[@]}"
 else
     ok "Capture dependencies satisfied."
 fi
@@ -663,6 +663,11 @@ EOF
         ufw logging off > /dev/null   # scans of the darknet would flood the log
         ufw default deny incoming > /dev/null
         ufw default allow outgoing > /dev/null
+        # No ping replies: passive addresses must not look alive (ufw lets pings through and has its own sysctl file)
+        # TODO figure out whether this is what we really want (also if it wont damage our cause)
+        sed -i '/^net\/ipv4\/icmp_echo_ignore_all=/d' /etc/ufw/sysctl.conf
+        echo "net/ipv4/icmp_echo_ignore_all=1" >> /etc/ufw/sysctl.conf
+        sysctl -q -w net.ipv4.icmp_echo_ignore_all=1
         for port in ${SSH_PORTS}; do
             if [[ -n "${MGMT_ADDR}" ]]; then
                 ufw allow proto tcp to "${MGMT_ADDR}" port "${port}" comment "nt-ssh" > /dev/null
@@ -679,14 +684,16 @@ EOF
         if [[ "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
             ok "Firewall already active - rules updated."
         else
-            systemd-run --quiet --unit=nt-ufw-rollback --on-active=5min /usr/sbin/ufw disable
+            systemd-run --quiet --unit=nt-ufw-rollback /bin/sh -c 'sleep 300; /usr/sbin/ufw disable'
             ufw --force enable > /dev/null
             warn "Firewall enabled (ssh port(s): ${SSH_PORTS//$'\n'/ }); it disables itself in 5 minutes unless you confirm."
             warn "Open a NEW ssh session to this node now (keep this one open), then answer here."
             read -r -p "Does the new session work? [y/N] " ANSWER
-            systemctl stop nt-ufw-rollback.timer
-            if [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+            systemctl stop nt-ufw-rollback 2>/dev/null || true
+            if [[ "${ANSWER}" =~ ^[Yy]$ && "$(ufw status 2>/dev/null)" == "Status: active"* ]]; then
                 ok "Firewall confirmed."
+            elif [[ "${ANSWER}" =~ ^[Yy]$ ]]; then
+                err "The 5 minutes had already passed and the firewall disabled itself - re-run setup.sh."
             else
                 ufw disable > /dev/null
                 err "Firewall disabled again. Check the ssh port and re-run setup.sh."
