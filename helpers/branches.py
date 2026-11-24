@@ -15,7 +15,8 @@ Always passive: the node's own management address, and the addresses ending in .
 gateway, broadcast: scanners treat them differently, so they are kept out of the comparison and flagged).
 
 The draw is reproducible from the seed: inside a group the addresses are ordered by sha256("<seed>:<address>"),
-the first quarter is r-irregular, the second quarter r-regular, the rest passive. A group of fewer than 4 addresses stays passive.
+the first quarter is r-irregular, the second quarter r-regular, the rest passive. A smaller last group rounds its quarter to
+the nearest whole address (7 addresses: 3 passive, 2, 2; fewer than 3: all passive).
 """
 import argparse
 import hashlib
@@ -69,7 +70,7 @@ def draw(addresses, mgmt, seed):
     for i in range(0, len(usable), GROUP):
         group = sorted(usable[i:i + GROUP],
                        key=lambda a: hashlib.sha256(f"{seed}:{ipaddress.IPv4Address(a)}".encode()).digest())
-        quarter = len(group) // 4
+        quarter = (len(group) + 1) // 4     # 7 left over: 3 passive, 2 + 2 answered
         irregular += group[:quarter]
         regular += group[quarter:2 * quarter]
     return sorted(irregular), sorted(regular)
