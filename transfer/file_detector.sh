@@ -8,7 +8,8 @@ REMOTE_USER="${REMOTE_USER:-telescope}"
 TUNNEL_HOST="${WG_REMOTE_ADDR:-}"
 REMOTE_PORT="${REMOTE_PORT:-8500}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
-SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10"
+SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+RSYNC_TIMEOUT=180
 DETECTOR_CPUS="${DETECTOR_CPUS:-}"
 
 LOCK_FILE="/tmp/nt-file-detector.lock"
@@ -48,10 +49,10 @@ transfer_file() {
             # The sweep may have sent it while we waited for the lock or slept between retries
             [[ -f "${filepath}" ]] || exit 2
 
-            rsync -az --checksum \
+            rsync -az --checksum --timeout="${RSYNC_TIMEOUT}" \
                 -e "${SSH_CMD}" \
                 "${filepath}" \
-                "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1     # ".", not "./": rrsync refuses "./"
+                "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1
 
             rm -f "${filepath}"
         ) 9>"${TRANSFER_LOCK}" || rc=$?

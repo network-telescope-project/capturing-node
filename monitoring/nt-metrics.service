@@ -1,0 +1,28 @@
+[Unit]
+Description=Network Telescope - metrics of the capturing node
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/network-telescope/capturing-node.env
+ExecStart=@PROJECT_ROOT@/monitoring/node_metrics.sh
+
+User=nt-capture
+Group=nt-capture
+# To read dumpcap's last words in the journal
+SupplementaryGroups=systemd-journal
+
+# /run/nt-metrics, read by prometheus-node-exporter
+RuntimeDirectory=nt-metrics
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+# CPUAffinity=0-1
+Nice=10
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+
+# Runs every minute: no "Started"/"Finished" lines
+LogLevelMax=warning
+SyslogIdentifier=nt-metrics

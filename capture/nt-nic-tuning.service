@@ -1,0 +1,18 @@
+[Unit]
+Description=Network Telescope - NIC settings for the capture
+After=network-online.target
+Wants=network-online.target
+Before=nt-capture.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/network-telescope/capturing-node.env
+ExecStart=@PROJECT_ROOT@/capture/nic_tuning.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nt-nic-tuning
+
+[Install]
+WantedBy=multi-user.target

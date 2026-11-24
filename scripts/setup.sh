@@ -90,6 +90,45 @@ install_wstunnel() {
     ok "wstunnel ${WSTUNNEL_VERSION} installed: ${WSTUNNEL_BIN}"
 }
 
+# Time sync
+sync_clock() {
+    timedatectl set-ntp true 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+            ok "Clock synchronised (NTP): $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+            return
+        fi
+        sleep 1
+    done
+
+    local host before after header server offsets=()
+    for host in www.debian.org www.google.com www.cloudflare.com www.wikipedia.org; do
+        before=$(date +%s%3N)
+        header=$(curl -sI --max-time 5 "https://${host}" 2>/dev/null | tr -d '\r' | sed -n 's/^[Dd]ate: //p' | head -1) || true
+        after=$(date +%s%3N)
+        [[ -n "${header}" ]] && server=$(date -d "${header}" +%s 2>/dev/null) || continue
+        offsets+=($(( server * 1000 + 500 - (before + after) / 2 )))
+        [[ ${#offsets[@]} -eq 3 ]] && break
+    done
+    if [[ ${#offsets[@]} -lt 3 ]]; then
+        warn "Clock NOT verified: NTP does not answer and neither do enough web servers. Set it by hand (date -u -s '...')."
+        return
+    fi
+    local sorted diff
+    mapfile -t sorted < <(printf '%s\n' "${offsets[@]}" | sort -n)
+    diff=${sorted[1]}
+    if (( sorted[2] - diff > 2000 && diff - sorted[0] > 2000 )); then
+        warn "Clock NOT verified: the web servers disagree (offsets ${sorted[*]} ms). Check it by hand: $(date -u)"
+    elif (( diff >= -2000 && diff <= 2000 )); then
+        ok "Clock OK: within 2 s of the web servers (no NTP)"
+    elif systemctl is-active --quiet nt-capture 2>/dev/null; then
+        warn "Clock is off by $(( diff / 1000 )) s, but not changed while nt-capture runs: stop it and re-run setup.sh."
+    else
+        date -s "@$(( ($(date +%s%3N) + diff) / 1000 ))" > /dev/null
+        ok "Clock was off by $(( diff / 1000 )) s, set from the web servers (no NTP): $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+    fi
+}
+
 # --Pre flight----------------------------------------------------------------
 require_root
 
@@ -132,6 +171,10 @@ if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
 else
     ok "Capture dependencies satisfied."
 fi
+
+# --Clock--------------------------------------------------------------------
+timedatectl set-timezone UTC || warn "Could not set the timezone to UTC."
+sync_clock
 
 # --User and directories-----------------------------------------------------
 log "Creating user and directories"
@@ -306,38 +349,14 @@ if ! ip link show "${IFACE}" 2>/dev/null | grep -q "state UP"; then
 fi
 
 # --NIC tuning-------------------------------------------------------------
-#IFACE=$(grep "^INTERFACE" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' | xargs)
-if [[ -n "${IFACE}" && "${IFACE}" != "lo" ]]; then
-    log "Tuning NIC: ${IFACE}"
-    # Maximize ring buffer
-    ethtool -G "${IFACE}" rx 4096 tx 4096 2>/dev/null || warn "Could not set ring buffer on ${IFACE}"
-    # Disable offloads that can cause issues with packet capture
-    # TODO this is supposedly not permanent - have to add some persistent fix
-    ethtool -K "${IFACE}" gro off lro off 2>/dev/null || warn "Could not disable GRO/LRO on ${IFACE}"
-
-    # IRQ affinity: pin NIC interrupts to capture CPUs
-    log "Setting NIC IRQ affinity to capture CPUs (${CAPTURE_CPUS})..."
-    # Convert cpu range to hex bitmask
-    AFFINITY_MASK=$(python3 -c "
-import sys
-r = '${CAPTURE_CPUS}'
-bits = 0
-for part in r.split(','):
-    if '-' in part:
-        s,e = map(int,part.split('-'))
-        for i in range(s,e+1): bits |= (1<<i)
-    else:
-        bits |= (1<<int(part))
-print(hex(bits)[2:])
-")
-    for irq_dir in /proc/irq/*/; do
-        smp_affinity="${irq_dir}smp_affinity"
-        [[ -f "${smp_affinity}" ]] || continue
-        echo "${AFFINITY_MASK}" > "${smp_affinity}" 2>/dev/null || true
-    done
-else
-    warn "INTERFACE is 'lo' or unset - skipping NIC tuning."
-fi
+# Receive ring, no packet merging, the NIC's interrupts on the capture CPUs
+log "Tuning NIC: ${IFACE}"
+chmod +x "${PROJECT_ROOT}/capture/nic_tuning.sh"
+sed "s|@PROJECT_ROOT@|${PROJECT_ROOT}|g" "${PROJECT_ROOT}/capture/nt-nic-tuning.service" > /etc/systemd/system/nt-nic-tuning.service
+systemctl daemon-reload
+systemctl enable nt-nic-tuning > /dev/null 2>&1
+systemctl restart nt-nic-tuning || warn "NIC tuning failed: journalctl -u nt-nic-tuning"
+journalctl -q -u nt-nic-tuning --no-pager -o cat -n 6 --since "-1 min" 2>/dev/null | grep nic_tuning || true
 
 # --Darknet destinations---------------------------------------------------
 # Prefixes routed to the node but not configured on it cannot be detected and has to be appended manually
@@ -424,25 +443,24 @@ cat > "${PROM_OVERRIDE_DIR}/nt-collectors.conf" <<EOF
 ExecStart=
 ExecStart=/usr/bin/prometheus-node-exporter \\
   --collector.disable-defaults \\
-  --collector.netstat \\
-  --collector.netstat.fields="^(TcpExt:(TCPSynRetrans|TCPFastRetrans)|Tcp:(RetransSegs|InErrs)|Udp:(RcvbufErrors|InErrors))$" \\
-  --collector.hwmon \\
-  --collector.ethtool \\
-  --collector.ethtool.metrics-include="rx_dropped|rx_missed_errors|rx_fifo_errors" \\
+  --collector.cpu \\
+  --collector.meminfo \\
+  --collector.netdev \\
+  --collector.softnet \\
   --collector.filesystem \\
   --collector.diskstats \\
-  --collector.processes \\
-  --collector.cpu \\
+  --collector.timex \\
+  --collector.textfile \\
+  --collector.textfile.directory=/run/nt-metrics \\
   --web.listen-address=":9100"
-
-
 
 # Pin to management CPUs
 CPUAffinity=${MGMT_CPUS}
 EOF
 
 systemctl daemon-reload
-systemctl enable --now prometheus-node-exporter
+systemctl enable prometheus-node-exporter
+systemctl restart prometheus-node-exporter
 
 # --SSH Key setup----------------------------------------------------------
 log "Setting up SSH key for transfer to processing node..."
@@ -473,9 +491,11 @@ UNIT_FILES=(
     transfer/nt-file-detector.service
     transfer/nt-sweep.service
     transfer/nt-sweep.timer
+    monitoring/nt-metrics.service
+    monitoring/nt-metrics.timer
 )
 
-chmod +x "${PROJECT_ROOT}/capture/capture.sh" "${PROJECT_ROOT}"/transfer/{file_detector,sweep}.sh "${SCRIPT_DIR}/start.sh"
+chmod +x "${PROJECT_ROOT}/capture/capture.sh" "${PROJECT_ROOT}"/transfer/{file_detector,sweep}.sh "${PROJECT_ROOT}/monitoring/node_metrics.sh" "${SCRIPT_DIR}/start.sh"
 
 # Patch CPU affinity into unit files
 for unit_file in "${UNIT_FILES[@]}"; do
@@ -493,10 +513,12 @@ done
 sed -i "s|^# CPUAffinity=2-7|CPUAffinity=${CAPTURE_CPUS}|" /etc/systemd/system/nt-capture.service
 sed -i "s|^# CPUAffinity=0-1|CPUAffinity=${MGMT_CPUS}|" /etc/systemd/system/nt-file-detector.service
 sed -i "s|^# CPUAffinity=0-1|CPUAffinity=${MGMT_CPUS}|" /etc/systemd/system/nt-sweep.service
+sed -i "s|^# CPUAffinity=0-1|CPUAffinity=${MGMT_CPUS}|" /etc/systemd/system/nt-metrics.service
 
 systemctl daemon-reload
-systemctl enable nt-capture nt-file-detector nt-sweep.timer
+systemctl enable nt-capture nt-file-detector nt-sweep.timer nt-metrics.timer
 systemctl try-restart nt-sweep.timer
+systemctl restart nt-metrics.timer
 
 for unit in nt-file-detector nt-capture; do
     if systemctl is-active --quiet "${unit}"; then
@@ -519,11 +541,11 @@ else
 
     NETS=$(env_value DARKNET_NETS)
     [[ -n "${NETS}" ]] || warn "DARKNET_NETS is empty: replace <DARKNET_NETS> in the command below (comma separated)."
-    REGISTER_CMD="sudo /opt/network-telescope/scripts/add-sensor.sh ${NODE_IP} \"${NETS:-<DARKNET_NETS>}\" \"$(cat "${SSH_DIR}/id_ed25519.pub")\" \"${WG_PUBKEY}\""
+    REGISTER_CMD="sudo ./scripts/add-sensor.sh ${NODE_IP} \"${NETS:-<DARKNET_NETS>}\" \"$(cat "${SSH_DIR}/id_ed25519.pub")\" \"${WG_PUBKEY}\""
 
     if [[ -z "$(env_value WG_ADDR)" || -z "$(env_value WG_REMOTE_ADDR)" || -z "$(env_value WG_REMOTE_PUBKEY)" ]]; then
         echo ""
-        warn "Register this node (run on the processing node):"
+        warn "Register this node (run on the processing node, in its repository):"
         echo "  ${REGISTER_CMD}"
         echo ""
         while true; do

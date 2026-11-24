@@ -17,7 +17,8 @@ REMOTE_USER="${REMOTE_USER:-telescope}"
 TUNNEL_HOST="${WG_REMOTE_ADDR:-}"    # the processing node, through the WireGuard tunnel
 REMOTE_PORT="${REMOTE_PORT:-8500}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
-SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10"
+SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+RSYNC_TIMEOUT=180
 DURATION="${DURATION:-3600}"
 
 MIN_AGE="${SWEEP_MIN_AGE:-600}"
@@ -51,7 +52,7 @@ send_file() {
         # The detector may have sent it while we waited for the lock
         [[ -f "${filepath}" ]] || exit 2
 
-        rsync -az --checksum \
+        rsync -az --checksum --timeout="${RSYNC_TIMEOUT}" \
             -e "${SSH_CMD}" \
             "${filepath}" \
             "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1
