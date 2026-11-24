@@ -12,3 +12,7 @@ Thumbs.db
 # Temp files
 *.tmp
 *.swp
+
+# Responder build output
+responder/bin
+responder/build

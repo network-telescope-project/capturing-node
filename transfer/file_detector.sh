@@ -5,9 +5,11 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/var/lib/network-telescope/data/raw}"
 TRANSFER_MODE="${TRANSFER_MODE:-local}"
 REMOTE_USER="${REMOTE_USER:-telescope}"
-REMOTE_HOST="${REMOTE_HOST:-}"
-REMOTE_DIR="${REMOTE_DIR:-/var/lib/network-telescope/data/queue}"
+TUNNEL_HOST="${WG_REMOTE_ADDR:-}"
+REMOTE_PORT="${REMOTE_PORT:-8500}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
+SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+RSYNC_TIMEOUT=180
 DETECTOR_CPUS="${DETECTOR_CPUS:-}"
 
 LOCK_FILE="/tmp/nt-file-detector.lock"
@@ -30,8 +32,8 @@ transfer_file() {
         return 0
     fi
 
-    if [[ -z "${REMOTE_HOST}" ]]; then
-        log_err "ERROR: REMOTE_HOST not set but TRANSFER_MODE=remote"
+    if [[ -z "${TUNNEL_HOST}" ]]; then
+        log_err "ERROR: WG_REMOTE_ADDR not set (tunnel not configured, run setup.sh) but TRANSFER_MODE=remote"
         return 1
     fi
 
@@ -39,7 +41,7 @@ transfer_file() {
     local rc
     while [[ ${attempt} -lt ${MAX_RETRIES} ]]; do
         attempt=$(( attempt + 1 ))
-        log_info "Transferring ${filename} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR} (attempt ${attempt})"
+        log_info "Transferring ${filename} to ${REMOTE_USER}@${TUNNEL_HOST}:${REMOTE_PORT} (attempt ${attempt})"
 
         rc=0
         (
@@ -47,10 +49,10 @@ transfer_file() {
             # The sweep may have sent it while we waited for the lock or slept between retries
             [[ -f "${filepath}" ]] || exit 2
 
-            rsync -az --checksum \
-                -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10" \
+            rsync -az --checksum --timeout="${RSYNC_TIMEOUT}" \
+                -e "${SSH_CMD}" \
                 "${filepath}" \
-                "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/" || exit 1
+                "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1
 
             rm -f "${filepath}"
         ) 9>"${TRANSFER_LOCK}" || rc=$?
@@ -84,7 +86,7 @@ trap 'rm -f "${LOCK_FILE}"; log_info "Stopped."' EXIT
 mkdir -p "${DATA_DIR}"
 
 log_info "Watching '${DATA_DIR}' for closed PCAP files (mode=${TRANSFER_MODE})"
-[[ "${TRANSFER_MODE}" == "remote" ]] && log_info "Remote target: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+[[ "${TRANSFER_MODE}" == "remote" ]] && log_info "Remote target: ${REMOTE_USER}@${TUNNEL_HOST}:${REMOTE_PORT}"
 
 INOTIFY_CMD=(inotifywait -m -e close_write -q --format '%w%f' "${DATA_DIR}")
 if [[ -n "${DETECTOR_CPUS}" ]]; then
@@ -93,7 +95,7 @@ if [[ -n "${DETECTOR_CPUS}" ]]; then
 fi
 
 "${INOTIFY_CMD[@]}" | while IFS= read -r filepath; do
-    [[ "${filepath}" == *.pcap ]] || continue
+    [[ "${filepath}" == *.pcap || "${filepath##*/}" == branches_*.tsv ]] || continue
 
     log_info "Closed: ${filepath}"
     transfer_file "${filepath}" || log_err "ERROR: transfer_file failed for ${filepath}"

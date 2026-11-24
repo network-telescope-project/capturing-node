@@ -14,9 +14,11 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/var/lib/network-telescope/data/raw}"
 TRANSFER_MODE="${TRANSFER_MODE:-local}"
 REMOTE_USER="${REMOTE_USER:-telescope}"
-REMOTE_HOST="${REMOTE_HOST:-}"
-REMOTE_DIR="${REMOTE_DIR:-/var/lib/network-telescope/data/queue}"
+TUNNEL_HOST="${WG_REMOTE_ADDR:-}"    # the processing node, through the WireGuard tunnel
+REMOTE_PORT="${REMOTE_PORT:-8500}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-/var/lib/network-telescope/.ssh/id_ed25519}"
+SSH_CMD="ssh -i ${SSH_KEY_PATH} -p ${REMOTE_PORT} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_KEY_PATH%/*}/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+RSYNC_TIMEOUT=180
 DURATION="${DURATION:-3600}"
 
 MIN_AGE="${SWEEP_MIN_AGE:-600}"
@@ -31,8 +33,8 @@ if [[ "${TRANSFER_MODE}" != "remote" ]]; then
     log_info "TRANSFER_MODE=${TRANSFER_MODE}, nothing to do"
     exit 0
 fi
-if [[ -z "${REMOTE_HOST}" ]]; then
-    log_err "ERROR: REMOTE_HOST not set but TRANSFER_MODE=remote"
+if [[ -z "${TUNNEL_HOST}" ]]; then
+    log_err "ERROR: WG_REMOTE_ADDR not set (tunnel not configured, run setup.sh) but TRANSFER_MODE=remote"
     exit 1
 fi
 if ! command -v fuser >/dev/null; then
@@ -50,10 +52,10 @@ send_file() {
         # The detector may have sent it while we waited for the lock
         [[ -f "${filepath}" ]] || exit 2
 
-        rsync -az --checksum \
-            -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10" \
+        rsync -az --checksum --timeout="${RSYNC_TIMEOUT}" \
+            -e "${SSH_CMD}" \
             "${filepath}" \
-            "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/" || exit 1
+            "${REMOTE_USER}@${TUNNEL_HOST}:." || exit 1
 
         rm -f "${filepath}"
     ) 9>"${TRANSFER_LOCK}" || rc=$?
@@ -67,14 +69,19 @@ send_file() {
     return "${rc}"
 }
 
-mapfile -t files < <(find "${DATA_DIR}" -maxdepth 1 -type f -name '*.pcap' -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
+mapfile -t files < <(find "${DATA_DIR}" -maxdepth 1 -type f \( -name '*.pcap' -o -name 'branches_*.tsv' \) -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
 
 if [[ ${#files[@]} -eq 0 ]]; then
     log_info "No PCAP files in ${DATA_DIR}"
     exit 0
 fi
 
-newest="${files[-1]}"
+newest=""
+for filepath in "${files[@]}"; do
+    if [[ "${filepath}" == *.pcap ]]; then
+        newest="${filepath}"
+    fi
+done
 dumpcap_running=0
 pgrep -x dumpcap >/dev/null && dumpcap_running=1
 
